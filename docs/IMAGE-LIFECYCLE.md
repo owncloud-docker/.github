@@ -21,19 +21,17 @@ images consumed by end users:
 - **`owncloud/server`** — ownCloud Classic (PHP application, packaged from a release tarball).
 - **`owncloud/ocis`** — ownCloud Infinite Scale (Go application, built from source).
 
-Three **supporting base images** exist only to build `owncloud/server`, plus a
-frontend image:
+Three **supporting base images** exist only to build `owncloud/server`:
 
 - **`owncloud/ubuntu`** — Ubuntu OS layer + shared tooling (gomplate, wait-for, retry).
 - **`owncloud/php`** — Apache + PHP on top of `owncloud/ubuntu`.
 - **`owncloud/base`** — ownCloud runtime, entrypoint and `occ` dispatcher on top of `owncloud/php`.
-- **`owncloud/web`** — ownCloud Web frontend (built independently, nginx-based).
 
 ### Repository topology
 
 Each image is maintained in its **own GitHub repository** under the
 [`owncloud-docker`](https://github.com/owncloud-docker) organisation
-(`server`, `ocis`, `base`, `php`, `ubuntu`, `web`). There is no monorepo.
+(`server`, `ocis`, `base`, `php`, `ubuntu`). There is no monorepo.
 
 The **`ubuntu` repository is the CI hub**: it hosts the *reusable* GitHub Actions
 workflows that every other repository calls
@@ -51,7 +49,6 @@ owncloud/ubuntu    ──►  owncloud/php  ──►  owncloud/base  ──► 
                                                                 (release tarball)
 
 owncloud/ocis      (independent, multi-stage build from source)
-owncloud/web       (independent, multi-stage, nginx)
 ```
 
 A rebuild of a lower layer (e.g. `owncloud/ubuntu` after an Ubuntu base bump) flows
@@ -68,7 +65,7 @@ calls the shared reusable workflow in the `ubuntu` repo. Two build strategies ex
 
 ### 2a. Cross-compile build — `docker-build.yml`
 
-Used by `ubuntu`, `php`, `base`, `server`, `web`. A single job:
+Used by `ubuntu`, `php`, `base`, `server`. A single job:
 
 1. Starts an ephemeral local registry (`registry:3` service on port 5000).
 2. Builds both architectures in one `docker/build-push-action` run (BuildKit / buildx)
@@ -106,7 +103,6 @@ The oCIS image (`ocis/v8/Dockerfile.multiarch`) is built entirely from source:
 |-------|--------|---------|
 | `server` | `TARBALL_URL` | URL of the `owncloud-complete-*.tar.bz2` release tarball, injected from the workflow matrix. No version is pinned inside the Dockerfile. |
 | `ocis` | `VERSION`, `GIT_REF`, `GIT_SHA`, `REVISION` | Git tag (`v${VERSION}`) or branch (`GIT_REF=master`) to clone; `GIT_SHA` pins a branch build to an exact commit (used by rolling builds); `REVISION` is embedded in OCI labels. |
-| `web` | `VERSION` | Release tag whose `web.tar.gz` is downloaded and **SHA256-verified** during build. |
 
 ---
 
@@ -122,7 +118,6 @@ consumers can either track a line of updates or pin an exact build.
 | `owncloud/ocis` | `8.0.5`, `8.0`, `8`, `8.0.5-<YYYYMMDD>` | Floating + immutable date tag. |
 | `owncloud/ocis` (RC) | `8.1.0-rc.2`, `8.1.0-rc.2-<YYYYMMDD>` | Version + immutable date tag, but **no floating `latest`/major/minor tags**. |
 | `owncloud/ocis-rolling` | `latest`, `<YYYYMMDD>`, `sha-<short>` | Daily build of oCIS `master` (unstable, testing only). |
-| `owncloud/web` | `12.3.3`, `12.3`, `12`, `latest` | Published on git tags only. |
 | `owncloud/{ubuntu,php,base}` | `22.04`, `24.04`, `22.04-<YYYYMMDD>` | Ubuntu-release-based tags + immutable date tag. |
 
 Immutable date/`sha-` tags exist specifically so a deployment can pin the exact bytes
@@ -231,9 +226,6 @@ mechanism differs per image, so where the upgrade happens matters:
   which then cascades upward.
 - **oCIS runtime** (final Alpine stage) runs `apk upgrade --no-cache`, so it picks up
   Alpine patch releases on every build directly.
-- **`web`** does **not** run `apk upgrade`; its final stage is the digest-pinned
-  `nginx:alpine` image, so its OS-package currency depends on that pinned digest being
-  bumped by Renovate (§5a), not on a build-time upgrade.
 
 Combined with the **scheduled rebuilds** below, this means OS security patches land as
 `owncloud/ubuntu` / base-digest rebuilds flow through the chain and, for oCIS, on every
@@ -285,7 +277,6 @@ The application (not OS) versions are updated deliberately, not automatically:
 - **`server`** — bump the `TARBALL_URL`/`version` entry in `server/.github/workflows/main.yml`.
 - **`ocis`** — bump the release matrix (git tag) in `ocis/.github/workflows/main.yml`;
   the rolling image already tracks `master` daily.
-- **`web`** — publish on the corresponding git tag; the tarball is SHA256-verified at build.
 
 ### 5g. Extended-support note — PHP 7.4
 
@@ -303,7 +294,6 @@ credentials never persist in the image. This keeps PHP 7.4 receiving security pa
   - `server`, `base`, `php`, `ubuntu`: on push to `master` (and the weekly schedule).
   - `ocis`: on any non-PR event (`master` + rolling schedule).
   - `ocis-rolling`: always, on the daily schedule.
-  - `web`: on git tags only.
   - Pull requests **build, scan and smoke-test but never push**.
 - **The smoke test gates the push.** Before publishing, the freshly built image is run
   and validated:
@@ -313,8 +303,8 @@ credentials never persist in the image. This keeps PHP 7.4 receiving security pa
     assert `.productversion`.
   - supporting images: a one-shot command check inside the container —
     `ubuntu` asserts `VERSION_ID` from `/etc/os-release`, `php` runs
-    `php --version | grep -qF 'PHP <ver>'`, `base` runs `php -r "echo 'OK';" | grep -q OK`,
-    and `web` runs `nginx -t`.
+    `php --version | grep -qF 'PHP <ver>'`, and `base` runs
+    `php -r "echo 'OK';" | grep -q OK`.
 - **Authentication:** `DOCKERHUB_USERNAME` (org variable) + `DOCKERHUB_TOKEN` (secret).
 - **Docker Hub description sync:** on publish, the reusable `docker-hub-desc.yml`
   workflow pushes each repo's `README.md` as the Docker Hub image description, so the
@@ -327,14 +317,13 @@ credentials never persist in the image. This keeps PHP 7.4 receiving security pa
 | Concern | Control | Mechanism | Cadence | Where enforced |
 |---------|---------|-----------|---------|----------------|
 | Base-OS CVEs | Digest-pinned bases, auto-bumped & auto-merged | Renovate (`owncloud-ops/renovate-presets:docker`) | Continuous; auto-merge on green CI | every image repo `.renovaterc.json` |
-| OS-package CVEs | Refresh packages at build time (per-image) | `apt-get upgrade` in `owncloud/ubuntu` (cascades to php/base/server); `apk upgrade` in oCIS runtime; `web` relies on pinned `nginx:alpine` digest bumps | Every build / base-digest bump | `ubuntu`, `ocis` `Dockerfile.multiarch`; §5a for `web` |
+| OS-package CVEs | Refresh packages at build time (per-image) | `apt-get upgrade` in `owncloud/ubuntu` (cascades to php/base/server); `apk upgrade` in oCIS runtime | Every build / base-digest bump | `ubuntu`, `ocis` `Dockerfile.multiarch` |
 | Unpatched images | Rebuild even with no code change | Scheduled workflow rebuilds | Weekly (all) + daily (ocis-rolling) | `main.yml` / `rolling.yml` |
 | Shipping a vulnerable image | Block publish on HIGH/CRITICAL | Trivy scan, `exit-code: 1`, `ignore-unfixed` | Every build incl. PRs | shared `docker-build*.yml` |
 | Accepted/unfixable CVEs | Documented, scoped exceptions | `.trivyignore` w/ justification | Reviewed each maintenance | per-repo/per-version files |
 | Reproducibility / supply chain | Immutable pins | SHA256 base digests; full-SHA Action pins | Continuous | Dockerfiles + workflows |
 | CI supply chain | Trusted, pinned Actions | Dependabot bumps; OSPO allowlist | Weekly | `.github/dependabot.yml`, OSPO policy |
 | Broken release | Runtime verification before push | Smoke test (status endpoint + version assert) | Every build | shared `docker-build*.yml` |
-| Tarball integrity (web) | Checksum verification | SHA256 verify at build | Every build | `web/Dockerfile.multiarch` |
 | Credential leakage | Build secrets, not layers | `--mount=type=secret` (Freexian mirror) | Every build | `php/v22.04/Dockerfile.multiarch` |
 
 ---
@@ -348,7 +337,6 @@ credentials never persist in the image. This keeps PHP 7.4 receiving security pa
 - [`owncloud-docker/base`](https://github.com/owncloud-docker/base)
 - [`owncloud-docker/php`](https://github.com/owncloud-docker/php)
 - [`owncloud-docker/ubuntu`](https://github.com/owncloud-docker/ubuntu)
-- [`owncloud-docker/web`](https://github.com/owncloud-docker/web)
 
 **Shared CI (in the `ubuntu` repo)**
 
