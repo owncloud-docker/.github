@@ -118,9 +118,9 @@ consumers can either track a line of updates or pin an exact build.
 | Image | Example tags | Notes |
 |-------|--------------|-------|
 | `owncloud/server` | `10.16.3`, `10.16`, `10`, `latest`, `10.16.3-<YYYYMMDD>` | Floating major/minor/`latest` plus an immutable date tag (`build-date-tag: true`). |
-| `owncloud/server` (RC) | `11.0.0-rc1` | Exact tag only — no floating `latest`/major tags. |
+| `owncloud/server` (RC) | `11.0.0-rc1`, `11.0.0-rc1-<YYYYMMDD>` | Version + immutable date tag, but **no floating `latest`/major/minor tags**. |
 | `owncloud/ocis` | `8.0.5`, `8.0`, `8`, `8.0.5-<YYYYMMDD>` | Floating + immutable date tag. |
-| `owncloud/ocis` (RC) | `8.1.0-rc.2` | Exact tag only. |
+| `owncloud/ocis` (RC) | `8.1.0-rc.2`, `8.1.0-rc.2-<YYYYMMDD>` | Version + immutable date tag, but **no floating `latest`/major/minor tags**. |
 | `owncloud/ocis-rolling` | `latest`, `<YYYYMMDD>`, `sha-<short>` | Daily build of oCIS `master` (unstable, testing only). |
 | `owncloud/web` | `12.3.3`, `12.3`, `12`, `latest` | Published on git tags only. |
 | `owncloud/{ubuntu,php,base}` | `22.04`, `24.04`, `22.04-<YYYYMMDD>` | Ubuntu-release-based tags + immutable date tag. |
@@ -199,9 +199,13 @@ upstream tag from entering an image unreviewed. To stay current, **Renovate** op
 PRs that bump these digests:
 
 - Every repository has a `.renovaterc.json` extending the shared preset
-  **`github>owncloud-ops/renovate-presets:docker`**, so update policy is centrally
-  governed.
-- The preset schedules digest-update PRs (weekly cadence, capped number of open PRs).
+  **`github>owncloud-ops/renovate-presets:docker`** (which in turn extends
+  `:base`), so update policy is centrally governed.
+- The preset **auto-merges** digest/pin updates for a curated allowlist of images —
+  including `owncloud/*`, `ubuntu`, `alpine`, `golang` and others — because these are
+  usually security patches. There is no fixed time-of-day schedule or open-PR cap for
+  Docker updates in the preset; digest-bump PRs are raised as upstream digests change
+  and merge automatically once CI (build → scan → smoke-test) passes.
 - Merging a digest-bump PR triggers a full build → scan → smoke-test → publish cycle,
   so the security fix in the new base layer flows straight to Docker Hub through the
   normal gated pipeline.
@@ -215,29 +219,41 @@ deliberate, human decision.
 
 ### 5b. OS packages inside the image — build-time upgrade
 
-Even between base-image digest bumps, each build refreshes OS packages to the latest
-patch level available at build time:
+OS packages are refreshed to the latest patch level available at build time. The
+mechanism differs per image, so where the upgrade happens matters:
 
-- Debian/Ubuntu images run `apt-get update && apt-get upgrade`.
-- Alpine images (oCIS runtime, web) run `apk upgrade --no-cache`.
+- **`owncloud/ubuntu`** (the base of the Ubuntu chain) runs an explicit
+  `apt-get update && apt-get upgrade`. The images built on top of it (`php`, `base`,
+  `server`) do **not** run `apt-get upgrade` themselves — they inherit the upgraded,
+  digest-pinned `owncloud/ubuntu` layer and their own `apt-get update` + install
+  pulls the current versions of the packages they add. So Ubuntu-side OS patches enter
+  the chain via an `owncloud/ubuntu` rebuild (a digest bump or the weekly schedule),
+  which then cascades upward.
+- **oCIS runtime** (final Alpine stage) runs `apk upgrade --no-cache`, so it picks up
+  Alpine patch releases on every build directly.
+- **`web`** does **not** run `apk upgrade`; its final stage is the digest-pinned
+  `nginx:alpine` image, so its OS-package currency depends on that pinned digest being
+  bumped by Renovate (§5a), not on a build-time upgrade.
 
-Combined with the **scheduled rebuilds** below, this means that even with no code
-change, a weekly (or daily, for rolling) rebuild pulls current OS security patches.
+Combined with the **scheduled rebuilds** below, this means OS security patches land as
+`owncloud/ubuntu` / base-digest rebuilds flow through the chain and, for oCIS, on every
+rebuild directly.
 
 ### 5c. Scheduled rebuilds — closing the CVE window automatically
 
 The pinning above is only useful if images are actually **rebuilt** so fixes land.
 Two schedules guarantee that:
 
-| Schedule | Cron | Scope | Effect |
-|----------|------|-------|--------|
-| **Weekly rebuild** | `0 0 * * 0` (Sun 00:00 UTC) | all image repos (`main.yml`) | Rebuilds against current base digests + runs `apt/apk upgrade`, re-scans with the latest Trivy DB, and re-publishes. Picks up OS/base CVE fixes without any manual bump. |
-| **Renovate** | weekly (Sun 22:00 UTC, ≤5 open PRs) | all repos | Opens digest/dependency bump PRs; merging rebuilds through the gated pipeline. |
+| Schedule | Cron / cadence | Scope | Effect |
+|----------|----------------|-------|--------|
+| **Weekly rebuild** | `0 0 * * 0` (Sun 00:00 UTC) | all image repos (`main.yml`) | Rebuilds against current base digests, re-scans with the latest Trivy DB, and re-publishes. Refreshes packages per the per-image mechanism in §5b (`owncloud/ubuntu` `apt-get upgrade`; oCIS `apk upgrade`). Picks up OS/base CVE fixes without any manual bump. |
+| **Renovate (digests)** | continuous; auto-merge on green CI | all repos w/ `.renovaterc.json` | Raises digest/pin bump PRs as upstream digests change; the allowlisted ones auto-merge once CI passes, rebuilding through the gated pipeline. No fixed schedule or open-PR cap in the preset. |
+| **Dependabot (Actions)** | weekly, Sun 22:00 UTC, ≤5 open PRs | repos w/ `.github/dependabot.yml` | Bumps GitHub Actions SHA pins (see §5e). |
 | **oCIS rolling** | `0 2 * * *` (daily 02:00 UTC) | `ocis/rolling.yml` | Rebuilds `owncloud/ocis-rolling` from oCIS `master` HEAD (pinned to the resolved commit SHA), so upstream fixes on `master` are testable next day. |
 
-Net effect: a HIGH/CRITICAL CVE with an upstream fix is picked up **at most one weekly
-cycle** after the fix is available (sooner if a Renovate PR is merged first), and the
-Trivy gate ensures the rebuilt image is verified clean before it ships.
+Net effect: a HIGH/CRITICAL CVE fixed in a base image is picked up as soon as its
+digest-bump PR auto-merges, and **at most one weekly cycle** later even if no digest
+changed; the Trivy gate ensures the rebuilt image is verified clean before it ships.
 
 ### 5d. Pinned tooling binaries — Renovate datasource hints
 
@@ -295,7 +311,10 @@ credentials never persist in the image. This keeps PHP 7.4 receiving security pa
     assert the reported `.versionstring` equals the tag.
   - `ocis`: poll `https://localhost:9200/status.php` (with `OCIS_INSECURE=true`) and
     assert `.productversion`.
-  - base images: a command check (e.g. `php --version`, `nginx -t`).
+  - supporting images: a one-shot command check inside the container —
+    `ubuntu` asserts `VERSION_ID` from `/etc/os-release`, `php` runs
+    `php --version | grep -qF 'PHP <ver>'`, `base` runs `php -r "echo 'OK';" | grep -q OK`,
+    and `web` runs `nginx -t`.
 - **Authentication:** `DOCKERHUB_USERNAME` (org variable) + `DOCKERHUB_TOKEN` (secret).
 - **Docker Hub description sync:** on publish, the reusable `docker-hub-desc.yml`
   workflow pushes each repo's `README.md` as the Docker Hub image description, so the
@@ -307,8 +326,8 @@ credentials never persist in the image. This keeps PHP 7.4 receiving security pa
 
 | Concern | Control | Mechanism | Cadence | Where enforced |
 |---------|---------|-----------|---------|----------------|
-| Base-OS CVEs | Digest-pinned bases, auto-bumped | Renovate (`owncloud-ops/renovate-presets:docker`) | Weekly PRs | every image repo `.renovaterc.json` |
-| OS-package CVEs | Refresh packages on every build | `apt-get upgrade` / `apk upgrade` in Dockerfiles | Every build | each `Dockerfile.multiarch` |
+| Base-OS CVEs | Digest-pinned bases, auto-bumped & auto-merged | Renovate (`owncloud-ops/renovate-presets:docker`) | Continuous; auto-merge on green CI | every image repo `.renovaterc.json` |
+| OS-package CVEs | Refresh packages at build time (per-image) | `apt-get upgrade` in `owncloud/ubuntu` (cascades to php/base/server); `apk upgrade` in oCIS runtime; `web` relies on pinned `nginx:alpine` digest bumps | Every build / base-digest bump | `ubuntu`, `ocis` `Dockerfile.multiarch`; §5a for `web` |
 | Unpatched images | Rebuild even with no code change | Scheduled workflow rebuilds | Weekly (all) + daily (ocis-rolling) | `main.yml` / `rolling.yml` |
 | Shipping a vulnerable image | Block publish on HIGH/CRITICAL | Trivy scan, `exit-code: 1`, `ignore-unfixed` | Every build incl. PRs | shared `docker-build*.yml` |
 | Accepted/unfixable CVEs | Documented, scoped exceptions | `.trivyignore` w/ justification | Reviewed each maintenance | per-repo/per-version files |
