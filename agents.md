@@ -6,11 +6,11 @@ This is the **organisation `.github` repository** for the
 [`owncloud-docker`](https://github.com/owncloud-docker) GitHub organisation. It
 holds no source code and builds no image. It serves two purposes:
 
-1. **Organisation-wide community health defaults** — the health files at the repo
-   root (`CODE_OF_CONDUCT.md`, `CONTRIBUTING.md`, `SECURITY.md`, `SUPPORT.md`)
-   are applied by GitHub to **every** repository in the org that does not supply
-   its own copy.
-2. **Shared documentation** — cross-repo reference docs under `docs/`.
+- **Organisation-wide community health defaults** — the health files at the repo
+  root (`CODE_OF_CONDUCT.md`, `CONTRIBUTING.md`, `SECURITY.md`, `SUPPORT.md`) are
+  applied by GitHub to **every** repository in the org that does not supply its
+  own copy.
+- **Shared documentation** — cross-repo reference docs under `docs/`.
 
 - **Classification:** Organisation meta-repository (no build)
 - **Activity Status:** Active
