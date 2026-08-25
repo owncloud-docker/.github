@@ -21,6 +21,15 @@ images consumed by end users:
 - **`owncloud/server`** — ownCloud Classic (PHP application, packaged from a release tarball).
 - **`owncloud/ocis`** — ownCloud Infinite Scale (Go application, built from source).
 
+One **extension image** is deployed alongside oCIS rather than instead of it:
+
+- **`owncloud/ocis-workflows`** — oCIS Workflows, an AI-powered file workflow automation
+  extension (built from source). Unlike the images above it carries **two deployables**:
+  the Go backend sidecar, which is the container's entrypoint, and the Vue web extension
+  for ownCloud Web. Both come from a single upstream checkout so they always ship in
+  lockstep. The web assets are baked in at `/web/apps/workflows` but are **not served by
+  this image** — an oCIS deployment copies that path into its `WEB_ASSET_APPS_PATH`.
+
 Three **supporting base images** exist only to build `owncloud/server`:
 
 - **`owncloud/ubuntu`** — Ubuntu OS layer + shared tooling (gomplate, wait-for, retry).
@@ -31,7 +40,7 @@ Three **supporting base images** exist only to build `owncloud/server`:
 
 Each image is maintained in its **own GitHub repository** under the
 [`owncloud-docker`](https://github.com/owncloud-docker) organisation
-(`server`, `ocis`, `base`, `php`, `ubuntu`). There is no monorepo.
+(`server`, `ocis`, `ocis-workflows`, `base`, `php`, `ubuntu`). There is no monorepo.
 
 The **`ubuntu` repository is the CI hub**: it hosts the *reusable* GitHub Actions
 workflows that every other repository calls
@@ -48,7 +57,9 @@ docker.io/ubuntu:<ver>@sha256:…      (upstream, digest-pinned)
 owncloud/ubuntu    ──►  owncloud/php  ──►  owncloud/base  ──►  owncloud/server
                                                                 (release tarball)
 
-owncloud/ocis      (independent, multi-stage build from source)
+owncloud/ocis            (independent, multi-stage build from source)
+owncloud/ocis-workflows  (independent, multi-stage build from source; deployed
+                          alongside owncloud/ocis as an extension)
 ```
 
 A rebuild of a lower layer (e.g. `owncloud/ubuntu` after an Ubuntu base bump) flows
@@ -75,10 +86,10 @@ Used by `ubuntu`, `php`, `base`, `server`. A single job:
 
 ### 2b. Native per-arch build + manifest merge — `docker-build-native.yml`
 
-Used by `ocis` (both the release `main.yml` and the `rolling.yml` workflow), because
-building oCIS from source cross-platform is expensive. A matrix runs the build
-**natively** on each architecture (`amd64` on `ubuntu-latest`, `arm64` on
-`ubuntu-24.04-arm`):
+Used by `ocis` (both the release `main.yml` and the `rolling.yml` workflow) and by
+`ocis-workflows`, because building these applications from source cross-platform is
+expensive. A matrix runs the build **natively** on each architecture (`amd64` on
+`ubuntu-latest`, `arm64` on `ubuntu-24.04-arm`):
 
 1. Each arch builds, loads the image locally, scans (Trivy) and smoke-tests it.
 2. On `master`, each arch pushes **by digest** (no tag) to Docker Hub and uploads its
@@ -97,12 +108,31 @@ The oCIS image (`ocis/v8/Dockerfile.multiarch`) is built entirely from source:
 - **runtime** (Alpine) — copies only the binary; runs `apk upgrade` so OS packages are
   at the latest Alpine patch level at build time.
 
+### 2d. oCIS Workflows three-stage from-source build
+
+`ocis-workflows/Dockerfile.multiarch` follows the same shape as §2c, but the frontend is
+shipped as static assets rather than embedded in the binary:
+
+- **`frontend-builder`** (node-alpine) — clones the upstream repo at `GIT_REF` (pinned to
+  `GIT_SHA` when set) and builds the Vue web extension with `pnpm build`.
+- **`go-builder`** (golang-alpine) — compiles the backend with `CGO_ENABLED=0` for
+  `TARGETARCH`. No CGO, so no libvips-style native dependencies.
+- **runtime** (Alpine) — runs `apk upgrade`, adds a non-root user (uid 1000), and copies
+  in **both** the binary (`/usr/local/bin/app`, the entrypoint) and the built frontend
+  assets (`/web/apps/workflows`).
+
+Because the Go stage compiles the shipped binary, the Go **standard library** linked into
+it is whatever the pinned `golang:*-alpine` digest provides. A stale digest therefore
+surfaces as `stdlib` findings against `/usr/local/bin/app` in the Trivy gate (§4); the fix
+is bumping the digest, not adding a `.trivyignore` entry. This applies equally to `ocis`.
+
 ### Build arguments (how the application version is selected)
 
 | Image | Arg(s) | Meaning |
 |-------|--------|---------|
 | `server` | `TARBALL_URL` | URL of the `owncloud-complete-*.tar.bz2` release tarball, injected from the workflow matrix. No version is pinned inside the Dockerfile. |
 | `ocis` | `VERSION`, `GIT_REF`, `GIT_SHA`, `REVISION` | Git tag (`v${VERSION}`) or branch (`GIT_REF=master`) to clone; `GIT_SHA` pins a branch build to an exact commit (used by rolling builds); `REVISION` is embedded in OCI labels. |
+| `ocis-workflows` | `GIT_REF`, `GIT_SHA`, `VERSION`, `REVISION` | Same scheme as `ocis`, but only `GIT_REF=main` is used today — upstream has no release tags yet, so a `prepare` job resolves `main` HEAD and passes it as `GIT_SHA`/`REVISION`. That reference also busts the clone layer's cache, so the rolling build never serves a stale checkout. |
 
 ---
 
@@ -118,6 +148,7 @@ consumers can either track a line of updates or pin an exact build.
 | `owncloud/ocis` | `8.0.5`, `8.0`, `8`, `8.0.5-<YYYYMMDD>` | Floating + immutable date tag. |
 | `owncloud/ocis` (RC) | `8.1.0-rc.2`, `8.1.0-rc.2-<YYYYMMDD>` | Version + immutable date tag, but **no floating `latest`/major/minor tags**. |
 | `owncloud/ocis-rolling` | `latest`, `<YYYYMMDD>`, `sha-<short>` | Daily build of oCIS `master` (unstable, testing only). |
+| `owncloud/ocis-workflows` | `latest`, `<YYYYMMDD>`, `sha-<short>` | **Rolling only, no version tags.** Upstream cuts no semver releases yet, so there is no version matrix; `latest` tracks upstream `main`. Pin the `sha-`/date tag in anything you care about. Once upstream starts tagging releases, this gains a version matrix following `owncloud/ocis`. |
 | `owncloud/{ubuntu,php,base}` | `22.04`, `24.04`, `22.04-<YYYYMMDD>` | Ubuntu-release-based tags + immutable date tag. |
 
 Immutable date/`sha-` tags exist specifically so a deployment can pin the exact bytes
@@ -224,12 +255,12 @@ mechanism differs per image, so where the upgrade happens matters:
   pulls the current versions of the packages they add. So Ubuntu-side OS patches enter
   the chain via an `owncloud/ubuntu` rebuild (a digest bump or the weekly schedule),
   which then cascades upward.
-- **oCIS runtime** (final Alpine stage) runs `apk upgrade --no-cache`, so it picks up
-  Alpine patch releases on every build directly.
+- **oCIS and oCIS Workflows runtimes** (final Alpine stage) run `apk upgrade --no-cache`,
+  so they pick up Alpine patch releases on every build directly.
 
 Combined with the **scheduled rebuilds** below, this means OS security patches land as
-`owncloud/ubuntu` / base-digest rebuilds flow through the chain and, for oCIS, on every
-rebuild directly.
+`owncloud/ubuntu` / base-digest rebuilds flow through the chain and, for the Alpine-based
+images, on every rebuild directly.
 
 ### 5c. Scheduled rebuilds — closing the CVE window automatically
 
@@ -238,7 +269,7 @@ Two schedules guarantee that:
 
 | Schedule | Cron / cadence | Scope | Effect |
 |----------|----------------|-------|--------|
-| **Weekly rebuild** | `0 0 * * 0` (Sun 00:00 UTC) | all image repos (`main.yml`) | Rebuilds against current base digests, re-scans with the latest Trivy DB, and re-publishes. Refreshes packages per the per-image mechanism in §5b (`owncloud/ubuntu` `apt-get upgrade`; oCIS `apk upgrade`). Picks up OS/base CVE fixes without any manual bump. |
+| **Weekly rebuild** | `0 0 * * 0` (Sun 00:00 UTC) | all image repos (`main.yml`) | Rebuilds against current base digests, re-scans with the latest Trivy DB, and re-publishes. Refreshes packages per the per-image mechanism in §5b (`owncloud/ubuntu` `apt-get upgrade`; oCIS and oCIS Workflows `apk upgrade`). Picks up OS/base CVE fixes without any manual bump. For `ocis-workflows` this is also how upstream application changes land, since it has no release matrix. |
 | **Renovate (digests)** | continuous; auto-merge on green CI | all repos w/ `.renovaterc.json` | Raises digest/pin bump PRs as upstream digests change; the allowlisted ones auto-merge once CI passes, rebuilding through the gated pipeline. No fixed schedule or open-PR cap in the preset. |
 | **Dependabot (Actions)** | weekly, Sun 22:00 UTC, ≤5 open PRs | repos w/ `.github/dependabot.yml` | Bumps GitHub Actions SHA pins (see §5e). |
 | **oCIS rolling** | `0 2 * * *` (daily 02:00 UTC) | `ocis/rolling.yml` | Rebuilds `owncloud/ocis-rolling` from oCIS `master` HEAD (pinned to the resolved commit SHA), so upstream fixes on `master` are testable next day. |
@@ -277,6 +308,9 @@ The application (not OS) versions are updated deliberately, not automatically:
 - **`server`** — bump the `TARBALL_URL`/`version` entry in `server/.github/workflows/main.yml`.
 - **`ocis`** — bump the release matrix (git tag) in `ocis/.github/workflows/main.yml`;
   the rolling image already tracks `master` daily.
+- **`ocis-workflows`** — nothing to bump: the pipeline resolves upstream `main` HEAD on
+  every run, so the published image follows upstream automatically. This changes to the
+  deliberate `ocis` model once upstream cuts semver releases.
 
 ### 5g. Extended-support note — PHP 7.4
 
@@ -294,6 +328,7 @@ credentials never persist in the image. This keeps PHP 7.4 receiving security pa
   - `server`, `base`, `php`, `ubuntu`: on push to `master` (and the weekly schedule).
   - `ocis`: on any non-PR event (`master` + rolling schedule).
   - `ocis-rolling`: always, on the daily schedule.
+  - `ocis-workflows`: on any non-PR event (`main` + weekly schedule).
   - Pull requests **build, scan and smoke-test but never push**.
 - **The smoke test gates the push.** Before publishing, the freshly built image is run
   and validated:
@@ -301,6 +336,8 @@ credentials never persist in the image. This keeps PHP 7.4 receiving security pa
     assert the reported `.versionstring` equals the tag.
   - `ocis`: poll `https://localhost:9200/status.php` (with `OCIS_INSECURE=true`) and
     assert `.productversion`.
+  - `ocis-workflows`: start `app server` and poll `http://localhost:9109/healthz` for
+    HTTP 200. There is no version to assert against, as the build has no version input.
   - supporting images: a one-shot command check inside the container —
     `ubuntu` asserts `VERSION_ID` from `/etc/os-release`, `php` runs
     `php --version | grep -qF 'PHP <ver>'`, and `base` runs
@@ -317,7 +354,8 @@ credentials never persist in the image. This keeps PHP 7.4 receiving security pa
 | Concern | Control | Mechanism | Cadence | Where enforced |
 |---------|---------|-----------|---------|----------------|
 | Base-OS CVEs | Digest-pinned bases, auto-bumped & auto-merged | Renovate (`owncloud-ops/renovate-presets:docker`) | Continuous; auto-merge on green CI | every image repo `.renovaterc.json` |
-| OS-package CVEs | Refresh packages at build time (per-image) | `apt-get upgrade` in `owncloud/ubuntu` (cascades to php/base/server); `apk upgrade` in oCIS runtime | Every build / base-digest bump | `ubuntu`, `ocis` `Dockerfile.multiarch` |
+| OS-package CVEs | Refresh packages at build time (per-image) | `apt-get upgrade` in `owncloud/ubuntu` (cascades to php/base/server); `apk upgrade` in the oCIS and oCIS Workflows runtimes | Every build / base-digest bump | `ubuntu`, `ocis`, `ocis-workflows` `Dockerfile.multiarch` |
+| Go stdlib CVEs in from-source images | Digest-pin the compiling toolchain, auto-bumped | Renovate bumps `golang:*-alpine`; Trivy flags `stdlib` against the shipped binary | Continuous; auto-merge on green CI | `ocis`, `ocis-workflows` `Dockerfile.multiarch` |
 | Unpatched images | Rebuild even with no code change | Scheduled workflow rebuilds | Weekly (all) + daily (ocis-rolling) | `main.yml` / `rolling.yml` |
 | Shipping a vulnerable image | Block publish on HIGH/CRITICAL | Trivy scan, `exit-code: 1`, `ignore-unfixed` | Every build incl. PRs | shared `docker-build*.yml` |
 | Accepted/unfixable CVEs | Documented, scoped exceptions | `.trivyignore` w/ justification | Reviewed each maintenance | per-repo/per-version files |
@@ -334,6 +372,7 @@ credentials never persist in the image. This keeps PHP 7.4 receiving security pa
 
 - [`owncloud-docker/server`](https://github.com/owncloud-docker/server)
 - [`owncloud-docker/ocis`](https://github.com/owncloud-docker/ocis)
+- [`owncloud-docker/ocis-workflows`](https://github.com/owncloud-docker/ocis-workflows)
 - [`owncloud-docker/base`](https://github.com/owncloud-docker/base)
 - [`owncloud-docker/php`](https://github.com/owncloud-docker/php)
 - [`owncloud-docker/ubuntu`](https://github.com/owncloud-docker/ubuntu)
