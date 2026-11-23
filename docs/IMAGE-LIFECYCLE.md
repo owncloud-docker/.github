@@ -21,7 +21,7 @@ images consumed by end users:
 - **`owncloud/server`** — ownCloud Classic (PHP application, packaged from a release tarball).
 - **`owncloud/ocis`** — ownCloud Infinite Scale (Go application, built from source).
 
-Two **extension images** are deployed alongside oCIS rather than instead of it:
+Three **extension images** are deployed alongside oCIS rather than instead of it:
 
 - **`owncloud/ocis-workflows`** — oCIS Workflows, an AI-powered file workflow automation
   extension (built from source). Unlike the images above it carries **two deployables**:
@@ -36,6 +36,12 @@ Two **extension images** are deployed alongside oCIS rather than instead of it:
   runtime serving that one extension's built assets on port 8080. See the upstream
   [`owncloud/web-extensions`](https://github.com/owncloud/web-extensions) repository for
   how an extension is wired into an oCIS deployment.
+- **`owncloud/ocis-groupware`** — oCIS Groupware, calendar and contacts for oCIS
+  (CalDAV/CardDAV, a Graph-shaped API and a web UI for ownCloud Web; built from source).
+  It is a standalone service, not a sidecar: it is served on the same domain as oCIS,
+  behind the same reverse proxy, and authenticates against oCIS as its OIDC issuer. Its
+  web app is embedded in the binary. It is the only image here on a **distroless**
+  runtime — no shell, no package manager, no libc.
 
 Three **supporting base images** exist only to build `owncloud/server`:
 
@@ -47,7 +53,8 @@ Three **supporting base images** exist only to build `owncloud/server`:
 
 Each image is maintained in its **own GitHub repository** under the
 [`owncloud-docker`](https://github.com/owncloud-docker) organisation
-(`server`, `ocis`, `ocis-workflows`, `web-extensions`, `base`, `php`, `ubuntu`). There is
+(`server`, `ocis`, `ocis-workflows`, `web-extensions`, `ocis-groupware`, `base`, `php`,
+`ubuntu`). There is
 no monorepo.
 
 The **`ubuntu` repository is the CI hub**: it hosts the *reusable* GitHub Actions
@@ -70,6 +77,8 @@ owncloud/ocis-workflows  (independent, multi-stage build from source; deployed
                           alongside owncloud/ocis as an extension)
 owncloud/web-extensions  (independent, multi-stage build from source; one image tag
                           per ownCloud Web extension release)
+owncloud/ocis-groupware  (independent, multi-stage build from source; distroless
+                          runtime, deployed alongside owncloud/ocis)
 ```
 
 A rebuild of a lower layer (e.g. `owncloud/ubuntu` after an Ubuntu base bump) flows
@@ -97,7 +106,8 @@ Used by `ubuntu`, `php`, `base`, `server`. A single job:
 ### 2b. Native per-arch build + manifest merge — `docker-build-native.yml`
 
 Used by `ocis` (both the release `main.yml` and the `rolling.yml` workflow),
-`ocis-workflows` and `web-extensions`, because building these applications from source
+`ocis-workflows`, `web-extensions` and `ocis-groupware`, because building these
+applications from source
 cross-platform is expensive. A matrix runs the build **natively** on each architecture
 (`amd64` on `ubuntu-latest`, `arm64` on `ubuntu-24.04-arm`):
 
@@ -179,6 +189,52 @@ JS analyser to resolve. This is the JS equivalent of the Go `stdlib` nuance in �
 the detection — a CVE in a bundled npm dependency is invisible to the scan and is fixed
 upstream in the extension's own dependency tree.
 
+### 2f. oCIS Groupware four-stage from-source build
+
+`ocis-groupware/Dockerfile.multiarch` builds one static binary that embeds its web app,
+and ships it on distroless:
+
+- **`source`** (golang-bookworm) — clones the upstream repo at `GIT_REF`, pinned to
+  `GIT_SHA` when set.
+- **`web`** (node-bookworm-slim) — builds the Vue web app with `npm ci && npm run build`.
+- **`build`** (golang-bookworm) — compiles `./cmd/ocis-groupware` with `CGO_ENABLED=0`
+  for `TARGETARCH`, embedding `web/dist`.
+- **runtime** (`gcr.io/distroless/static-debian12:nonroot`) — only the binary
+  (`/ocis-groupware`, the entrypoint) and a `/data` directory owned by uid/gid 65532, the
+  distroless `nonroot` user. The uid is not 1000 like `ocis-workflows` because upstream's
+  Helm chart, its documentation and existing volumes all assume 65532.
+
+There is **no `apk upgrade` (or any package refresh) at build time**, because distroless
+has no package manager. The runtime layer is exactly what the pinned distroless digest
+contains, so a rebuild without a digest bump changes nothing in it (§5b). Nearly all of
+this image's CVE surface is the Go modules and Go `stdlib` compiled into the binary: the
+`stdlib` nuance from §2d applies, here to the `golang:*-bookworm` digest. As in §2e, the
+web app's npm dependencies are bundled by Vite and then embedded in the Go binary, so
+Trivy does not see them.
+
+**Which releases get built is polled, as in §2e,** by `scripts/resolve-pending-releases.sh`
+in a `prepare` job:
+
+- Only plain `vX.Y.Z` upstream tags are candidates; release candidates and other tags are
+  ignored.
+- **Every candidate must be an annotated tag whose signature GitHub verifies**
+  (`scripts/verify-tag.sh`); an unsigned or unverified tag is skipped with a warning and
+  never built. The build is pinned to the commit the verified tag points to (`GIT_SHA`),
+  so a tag moved after resolution cannot change what is built.
+- The matrix holds every verified release that is not on Docker Hub yet (one leg each,
+  `fail-fast: false`), so two releases landing in one polling window are both built.
+- **Unlike `web-extensions`, the matrix is never empty on the events that matter for
+  security:** a push to `main` (including a merged Dependabot bump), the weekly schedule
+  and a `workflow_dispatch` with `rebuild-newest` also add the **newest** release, and a
+  pull request always builds the newest release (or upstream `main` while there is none,
+  or it does not verify) without pushing it. So a PR that changes `Dockerfile.multiarch`
+  is built, scanned and smoke-tested, and a merged digest bump is published.
+- Only the newest release is ever rebuilt. Once a newer release exists, an older
+  `X.Y.Z` is frozen as last built (§5c).
+
+Publishing runs are serialised (one `concurrency` group for all non-PR events), so an
+older run finishing late cannot move `latest` back to an older release.
+
 ### Build arguments (how the application version is selected)
 
 | Image | Arg(s) | Meaning |
@@ -187,6 +243,7 @@ upstream in the extension's own dependency tree.
 | `ocis` | `VERSION`, `GIT_REF`, `GIT_SHA`, `REVISION` | Git tag (`v${VERSION}`) or branch (`GIT_REF=master`) to clone; `GIT_SHA` pins a branch build to an exact commit (used by rolling builds); `REVISION` is embedded in OCI labels. |
 | `ocis-workflows` | `GIT_REF`, `GIT_SHA`, `VERSION`, `REVISION` | Same scheme as `ocis`, but only `GIT_REF=main` is used today — upstream has no release tags yet, so a `prepare` job resolves `main` HEAD and passes it as `GIT_SHA`/`REVISION`. That reference also busts the clone layer's cache, so the rolling build never serves a stale checkout. |
 | `web-extensions` | `GIT_REF`, `PACKAGE`, `VERSION`, `REVISION` | `GIT_REF` is the upstream release tag to clone (`<package>-v<version>`); `PACKAGE` selects which `packages/web-app-<PACKAGE>` to build, so one Dockerfile produces every extension image; `VERSION`/`REVISION` are embedded in OCI labels. All four come from the polled matrix (§2e), never from a checked-in list. The `web-app-` prefix is assumed, not checked: a release tagged for a non-`web-app-` package (upstream also has `packages/ai-llm-proxy`) would be matched by the resolver and then fail the build, and `ignored-releases.txt` is the only way to exclude it. |
+| `ocis-groupware` | `GIT_REF`, `GIT_SHA`, `VERSION`, `REVISION` | Same scheme as `ocis`, but all four come from the polled matrix (§2f): `GIT_REF` is the verified upstream tag (`vX.Y.Z`), `GIT_SHA` and `REVISION` the commit it points to, `VERSION` the plain `X.Y.Z`. A PR with no verifiable release builds `GIT_REF=main` at its resolved HEAD. |
 
 ---
 
@@ -204,6 +261,7 @@ consumers can either track a line of updates or pin an exact build.
 | `owncloud/ocis-rolling` | `latest`, `<YYYYMMDD>`, `sha-<short>` | Daily build of oCIS `master` (unstable, testing only). |
 | `owncloud/ocis-workflows` | `latest`, `<YYYYMMDD>`, `sha-<short>` | **Rolling only, no version tags.** Upstream cuts no semver releases yet, so there is no version matrix; `latest` tracks upstream `main`. Pin the `sha-`/date tag in anything you care about. Once upstream starts tagging releases, this gains a version matrix following `owncloud/ocis`. |
 | `owncloud/web-extensions` | `vim-nav-0.1.0`, `vim-nav-latest` | **One repository, many extensions.** Every tag is prefixed with the extension name: an immutable `<extension>-<version>` plus a floating `<extension>-latest`. No date tag — a given release is built once, so the version tag is already immutable. This pipeline publishes **no** global `latest` (no extension is "the" image). **Most tags in this repository predate this pipeline** (census as of 2026-09-21): of 98 tags only the 12 pushed on 2026-09-18 came from it (6 extensions × version + `-latest`). The other 86 — including 18 of the 24 `<extension>-latest` tags, e.g. `cast-latest` (2026-06-15) — were pushed by the upstream repo's own, now-superseded automation, and one global `latest` dates from 2024. Two consequences: those legacy tags are **`amd64`-only** (no arm64 manifest, unlike everything this pipeline builds), and since the resolver treats "tag exists on Docker Hub" as "already published", **their immutable `<extension>-<version>` tags will never be rebuilt or Trivy-scanned here** (§2e, §5c). A legacy `<extension>-latest` is fixed by that extension's next release, which re-points it at a freshly scanned multi-arch image; a legacy version tag never is. `<extension>-latest` is applied per matrix leg with no ordering, so a release for an older but still-maintained line, packaged after a newer one, takes the floating tag — pin `<extension>-<version>` where that matters. |
+| `owncloud/ocis-groupware` | `0.1.0`, `0.1.0-<YYYYMMDD>`, `latest` | Version + date tag on every build; `latest` only on the highest upstream release. **No floating `X.Y`/`X` tags** (the project is pre-1.0). `X.Y.Z` is re-pushed by every rebuild while it is the newest release, then frozen. The date tag is immutable *across* days, but a second rebuild on the same day replaces that day's tag — pin by digest for the exact bytes. |
 | `owncloud/{ubuntu,php,base}` | `22.04`, `24.04`, `22.04-<YYYYMMDD>` | Ubuntu-release-based tags + immutable date tag. |
 
 Immutable date/`sha-` tags exist specifically so a deployment can pin the exact bytes
@@ -284,10 +342,10 @@ PRs that bump these digests:
 
 - `server`, `ocis`, `base`, `php` and `ubuntu` have a `.renovaterc.json` extending the
   shared preset **`github>owncloud-ops/renovate-presets:docker`** (which in turn extends
-  `:base`), so update policy is centrally governed for them. The two extension-image
-  repos, `ocis-workflows` and `web-extensions`, have **no** Renovate config: their base
-  digests are bumped by weekly Dependabot PRs instead (§5c), which do **not** auto-merge
-  and so wait for a human.
+  `:base`), so update policy is centrally governed for them. The three extension-image
+  repos, `ocis-workflows`, `web-extensions` and `ocis-groupware`, have **no** Renovate
+  config: their base digests are bumped by weekly Dependabot PRs instead (§5c), which do
+  **not** auto-merge and so wait for a human.
 - The preset **auto-merges** digest/pin updates for a curated allowlist of images —
   including `owncloud/*`, `ubuntu`, `alpine`, `golang` and others — because these are
   usually security patches. There is no fixed time-of-day schedule or open-PR cap for
@@ -298,7 +356,8 @@ PRs that bump these digests:
   normal gated pipeline. **Not so for `web-extensions`:** the push to `main` runs its
   workflow, but the release poll finds nothing pending and the build is skipped, so a
   merged base-image bump publishes nothing. The bumped digest only reaches Docker Hub
-  with that extension's next release (§5c).
+  with that extension's next release (§5c). `ocis-groupware` does not have this gap: a
+  push to `main` always rebuilds and re-publishes its newest release (§2f).
 - Because the images form a chain, a base bump (e.g. `owncloud/ubuntu`) cascades:
   Renovate then bumps the pinned `owncloud/php` digest, then `owncloud/base`, then
   `owncloud/server`.
@@ -323,6 +382,10 @@ mechanism differs per image, so where the upgrade happens matters:
   for Web Extensions) run `apk upgrade --no-cache`, so they pick up Alpine patch releases
   on every build directly. For `web-extensions` "every build" is narrower than it sounds:
   see the caveat in §5c.
+- **oCIS Groupware** (distroless `static`) has no package manager and refreshes nothing
+  at build time. Its few OS files (`base-files`, `ca-certificates`, `media-types`, `netbase`, `tzdata`)
+  change only when Dependabot bumps the pinned distroless digest and that PR is merged;
+  a scheduled rebuild alone does not touch them.
 
 Combined with the **scheduled rebuilds** below, this means OS security patches land as
 `owncloud/ubuntu` / base-digest rebuilds flow through the chain and, for the Alpine-based
@@ -335,17 +398,21 @@ Two schedules guarantee that:
 
 | Schedule | Cron / cadence | Scope | Effect |
 |----------|----------------|-------|--------|
-| **Weekly rebuild** | `0 0 * * 0` (Sun 00:00 UTC) | all image repos except `web-extensions` (`main.yml`) | Rebuilds against current base digests, re-scans with the latest Trivy DB, and re-publishes. Refreshes packages per the per-image mechanism in §5b (`owncloud/ubuntu` `apt-get upgrade`; oCIS and oCIS Workflows `apk upgrade`). Picks up OS/base CVE fixes without any manual bump. For `ocis-workflows` this is also how upstream application changes land, since it has no release matrix. |
+| **Weekly rebuild** | `0 0 * * 0` (Sun 00:00 UTC); `0 3 * * 0` (Sun 03:00 UTC) in `ocis-groupware` | all image repos except `web-extensions` (`main.yml`) | Rebuilds against current base digests, re-scans with the latest Trivy DB, and re-publishes. Refreshes packages per the per-image mechanism in §5b (`owncloud/ubuntu` `apt-get upgrade`; oCIS and oCIS Workflows `apk upgrade`). Picks up OS/base CVE fixes without any manual bump. For `ocis-workflows` this is also how upstream application changes land, since it has no release matrix. For `ocis-groupware` only the **newest** release is rebuilt, and because distroless refreshes no packages (§5b), the weekly run mainly re-scans with the latest Trivy DB; fixes still arrive through merged digest bumps. |
 | **Renovate (digests)** | continuous; auto-merge on green CI | all repos w/ `.renovaterc.json` | Raises digest/pin bump PRs as upstream digests change; the allowlisted ones auto-merge once CI passes, rebuilding through the gated pipeline. No fixed schedule or open-PR cap in the preset. |
 | **Dependabot (Actions)** | weekly, Sun 22:00 UTC, ≤5 open PRs | repos w/ `.github/dependabot.yml` | Bumps GitHub Actions SHA pins (see §5e). |
-| **Dependabot (Docker)** | weekly, Sun 22:00 UTC, ≤5 open PRs | `ocis-workflows`, `web-extensions` (the two repos with a `docker` ecosystem and no Renovate config) | Bumps the base-image digests in `Dockerfile.multiarch` — the job Renovate does for the other repos (§5a), but human-merged, so a base CVE fix waits for a reviewer. |
+| **Dependabot (Docker)** | weekly, Sun 22:00 UTC, ≤5 open PRs | `ocis-workflows`, `web-extensions`, `ocis-groupware` (the three repos with a `docker` ecosystem and no Renovate config) | Bumps the base-image digests in `Dockerfile.multiarch` — the job Renovate does for the other repos (§5a), but human-merged, so a base CVE fix waits for a reviewer. |
 | **oCIS rolling** | `0 2 * * *` (daily 02:00 UTC) | `ocis/rolling.yml` | Rebuilds `owncloud/ocis-rolling` from oCIS `master` HEAD (pinned to the resolved commit SHA), so upstream fixes on `master` are testable next day. |
 | **Web Extensions release poll** | `0 */6 * * *` (every 6 h) | `web-extensions/main.yml` | A *release* trigger, not a rebuild schedule: each run re-polls upstream tags against Docker Hub (§2e), so a new extension release is packaged within 6 hours. **Caveat for the security team:** when nothing is pending the matrix is empty and `build` is skipped, so already-published extension tags are never rebuilt on a schedule. Base-image CVE fixes therefore reach an extension only when that extension cuts its next release — a manual `workflow_dispatch` does not help, since it resolves the same empty matrix. |
+| **oCIS Groupware release poll** | `0 */6 * * *` (every 6 h) | `ocis-groupware/main.yml` | A *release* trigger, like the Web Extensions poll: each run builds every verified upstream release not yet on Docker Hub (§2f), so a new release is published within 6 hours. With nothing pending the run builds nothing, but unlike `web-extensions` this does not leave a gap: the weekly rebuild and every push to `main` rebuild the newest release. **Caveat for the security team:** only the newest release is ever rebuilt. Once `0.2.0` is out, `0.1.0` stays as last built and picks up no further fixes. |
 
 Net effect: a HIGH/CRITICAL CVE fixed in a base image is picked up as soon as its
 digest-bump PR auto-merges, and **at most one weekly cycle** later even if no digest
 changed; the Trivy gate ensures the rebuilt image is verified clean before it ships. The
 one exception is `web-extensions`, which has no rebuild-only schedule — see its row above.
+For `ocis-groupware` the window is bounded by the human-merged Dependabot bump instead:
+distroless refreshes nothing at build time, so a weekly rebuild with no digest bump ships
+the same layers.
 
 ### 5d. Pinned tooling binaries — Renovate datasource hints
 
@@ -386,6 +453,9 @@ The application (not OS) versions are updated deliberately, not automatically:
   `web-extensions/scripts/ignored-releases.txt`, a curated list of upstream tags that
   must never be built (bootstrap-era releases nobody wants packaged). Nothing is added
   to or expires from it automatically.
+- **`ocis-groupware`** — nothing to bump: new signed upstream `vX.Y.Z` tags are
+  discovered by polling (§2f). There is no ignore list; the control is upstream's tag
+  signature, since an unsigned or unverified tag is never built.
 
 ### 5g. Extended-support note — PHP 7.4
 
@@ -408,6 +478,10 @@ credentials never persist in the image. This keeps PHP 7.4 receiving security pa
     `workflow_dispatch` — see the branch caveat in §2b), and only
     for releases that are not on Docker Hub yet — a run with nothing pending pushes
     nothing at all.
+  - `ocis-groupware`: on any non-PR event (`main`, the 6-hourly release poll, the weekly
+    schedule or a manual `workflow_dispatch`): every release not on Docker Hub yet, plus
+    the newest release on a push to `main`, the weekly schedule or a dispatch with
+    `rebuild-newest`.
   - Pull requests **build, scan and smoke-test but never push** — except in
     `web-extensions`, where a PR builds only what the poll happens to find pending, so a
     PR can be green without any image having been built or scanned (§2e).
@@ -423,6 +497,11 @@ credentials never persist in the image. This keeps PHP 7.4 receiving security pa
     every extension ships a `public/manifest.json` that Vite copies verbatim into `dist/`,
     so one probe works for every extension with no per-extension special-casing. No
     version assertion: the built assets expose no version endpoint.
+  - `ocis-groupware`: start the default entrypoint with a placeholder
+    `GROUPWARE_OIDC_ISSUER=https://ocis.invalid` (the service starts without reaching its
+    issuer) and poll `http://localhost:9180/healthz` for HTTP 200. The image has no shell,
+    so the test cannot run a command inside it. No version assertion: the binary reports
+    no version.
   - supporting images: a one-shot command check inside the container —
     `ubuntu` asserts `VERSION_ID` from `/etc/os-release`, `php` runs
     `php --version | grep -qF 'PHP <ver>'`, and `base` runs
@@ -441,10 +520,11 @@ credentials never persist in the image. This keeps PHP 7.4 receiving security pa
 
 | Concern | Control | Mechanism | Cadence | Where enforced |
 |---------|---------|-----------|---------|----------------|
-| Base-OS CVEs | Digest-pinned bases, auto-bumped; auto-merged except in the two Dependabot repos | Renovate (`owncloud-ops/renovate-presets:docker`); Dependabot in `ocis-workflows` and `web-extensions`, which have no Renovate config | Continuous, auto-merge on green CI (Renovate); weekly, human-merged (Dependabot) | `.renovaterc.json` in `server`, `ocis`, `base`, `php`, `ubuntu`; `.github/dependabot.yml` elsewhere |
-| OS-package CVEs | Refresh packages at build time (per-image) | `apt-get upgrade` in `owncloud/ubuntu` (cascades to php/base/server); `apk upgrade` in the oCIS, oCIS Workflows and Web Extensions runtimes | Every build / base-digest bump | `ubuntu`, `ocis`, `ocis-workflows`, `web-extensions` `Dockerfile.multiarch` (for `web-extensions` only when a release is pending — §5c) |
-| Go stdlib CVEs in from-source images | Digest-pin the compiling toolchain, auto-bumped | `golang:*-alpine` bumped by Renovate (`ocis`) or Dependabot (`ocis-workflows`); Trivy flags `stdlib` against the shipped binary | Continuous, auto-merge on green CI (`ocis`); weekly, human-merged (`ocis-workflows`) | `ocis`, `ocis-workflows` `Dockerfile.multiarch` |
-| Unpatched images | Rebuild even with no code change | Scheduled workflow rebuilds | Weekly (all except `web-extensions`, which rebuilds only on a new upstream release — §5c) + daily (ocis-rolling) | `main.yml` / `rolling.yml` |
+| Base-OS CVEs | Digest-pinned bases, auto-bumped; auto-merged except in the three Dependabot repos | Renovate (`owncloud-ops/renovate-presets:docker`); Dependabot in `ocis-workflows`, `web-extensions` and `ocis-groupware`, which have no Renovate config | Continuous, auto-merge on green CI (Renovate); weekly, human-merged (Dependabot) | `.renovaterc.json` in `server`, `ocis`, `base`, `php`, `ubuntu`; `.github/dependabot.yml` elsewhere |
+| OS-package CVEs | Refresh packages at build time (per-image) | `apt-get upgrade` in `owncloud/ubuntu` (cascades to php/base/server); `apk upgrade` in the oCIS, oCIS Workflows and Web Extensions runtimes | Every build / base-digest bump | `ubuntu`, `ocis`, `ocis-workflows`, `web-extensions` `Dockerfile.multiarch` (for `web-extensions` only when a release is pending — §5c). Not `ocis-groupware`: distroless has no package manager, so its OS files change only with a distroless digest bump (§5b) |
+| Go stdlib CVEs in from-source images | Digest-pin the compiling toolchain, auto-bumped | `golang:*-alpine` bumped by Renovate (`ocis`) or Dependabot (`ocis-workflows`); `golang:*-bookworm` bumped by Dependabot (`ocis-groupware`); Trivy flags `stdlib` against the shipped binary | Continuous, auto-merge on green CI (`ocis`); weekly, human-merged (`ocis-workflows`, `ocis-groupware`) | `ocis`, `ocis-workflows`, `ocis-groupware` `Dockerfile.multiarch` |
+| Unpatched images | Rebuild even with no code change | Scheduled workflow rebuilds | Weekly (all except `web-extensions`, which rebuilds only on a new upstream release — §5c; `ocis-groupware` rebuilds only its newest release) + daily (ocis-rolling) | `main.yml` / `rolling.yml` |
+| Untrusted upstream source | Build only signed releases, pinned to the verified commit | `verify-tag.sh`: annotated tag, GitHub-verified signature; `GIT_SHA` pin | Every resolved release | `ocis-groupware/scripts/` |
 | Shipping a vulnerable image | Block publish on HIGH/CRITICAL | Trivy scan, `exit-code: 1`, `ignore-unfixed` | Every build incl. PRs | shared `docker-build*.yml` |
 | Accepted/unfixable CVEs | Documented, scoped exceptions | `.trivyignore` w/ justification | Reviewed each maintenance | per-repo/per-version files |
 | Reproducibility / supply chain | Immutable pins | SHA256 base digests; full-SHA Action pins | Continuous | Dockerfiles + workflows |
@@ -462,6 +542,7 @@ credentials never persist in the image. This keeps PHP 7.4 receiving security pa
 - [`owncloud-docker/ocis`](https://github.com/owncloud-docker/ocis)
 - [`owncloud-docker/ocis-workflows`](https://github.com/owncloud-docker/ocis-workflows)
 - [`owncloud-docker/web-extensions`](https://github.com/owncloud-docker/web-extensions)
+- [`owncloud-docker/ocis-groupware`](https://github.com/owncloud-docker/ocis-groupware)
 - [`owncloud-docker/base`](https://github.com/owncloud-docker/base)
 - [`owncloud-docker/php`](https://github.com/owncloud-docker/php)
 - [`owncloud-docker/ubuntu`](https://github.com/owncloud-docker/ubuntu)
@@ -470,15 +551,15 @@ credentials never persist in the image. This keeps PHP 7.4 receiving security pa
 
 - `.github/workflows/docker-build.yml` — cross-compile build, scan, smoke test, publish
 - `.github/workflows/docker-build-native.yml` — per-arch build + manifest merge
-  (oCIS, oCIS Workflows, Web Extensions)
+  (oCIS, oCIS Workflows, Web Extensions, oCIS Groupware)
 - `.github/workflows/docker-hub-desc.yml` — Docker Hub description sync
 
 **Dependency automation**
 
 - `.renovaterc.json` in `server`, `ocis`, `base`, `php`, `ubuntu` → preset [`owncloud-ops/renovate-presets`](https://github.com/owncloud-ops/renovate-presets)
 - `.github/dependabot.yml` (GitHub Actions updates everywhere; **also** the Docker
-  base-image updates in `ocis-workflows` and `web-extensions`, which have no Renovate
-  config — see §5a)
+  base-image updates in `ocis-workflows`, `web-extensions` and `ocis-groupware`, which
+  have no Renovate config — see §5a)
 
 **Vulnerability exceptions**
 
